@@ -55,10 +55,10 @@ func doMap(
 	for i := 0; i < nReduce; i++ {
 		filename := reduceName(jobName, mapTaskNumber, i)
 		f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
-		defer f.Close()
 		if err != nil {
 			log.Fatalf("os.OpenFile error(%v)", err)
 		}
+		defer f.Close()
 		files[uint32(i)] = f
 	}
 
