@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	// "fmt"
 	"labrpc"
 	"log"
 	"math/rand"
@@ -163,9 +162,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// 转化为follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.mu.Unlock()
 		rf.convertFollower()
-		rf.mu.Lock()
 	}
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.logNewer(args) {
@@ -173,7 +170,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.recvLeader <- struct{}{}
-		// fmt.Printf("%d vote for %d\n", rf.me, args.CandidateId)
 		return
 	}
 
@@ -246,9 +242,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.mu.Unlock()
 		rf.convertFollower()
-		rf.mu.Lock()
 	}
 
 	// 如果日志在 prevLogIndex 位置处的日志条目的任期号和 prevLogTerm 不匹配，则返回 false
@@ -267,13 +261,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	if len(rf.logs) <= args.PrevLogIndex {
 		reply.ConflictTerm = 0
 		reply.ConflictIndex = len(rf.logs)
-
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	// TODO 如果已经存在的日志条目和新的产生冲突（索引值相同但是任期号不同），删除这一条和之后所有的
+	// 如果已经存在的日志条目和新的产生冲突（索引值相同但是任期号不同），删除这一条和之后所有的
 	// 附加任何在已有的日志中不存在的条目
 	if len(args.Entries) > 0 {
 		rf.logs = rf.logs[:args.PrevLogIndex+1]
@@ -313,12 +306,11 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, repy *Appe
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	index := rf.lastLogIndex()
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
 
 	if rf.state == Leader {
 		rf.logs = append(rf.logs, &logEntries{
@@ -328,12 +320,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		index = rf.lastLogIndex()
 		term = rf.currentTerm
-	} else {
-		isLeader = false
 	}
-	// if isLeader {
-	// 	fmt.Printf("(server-%d)Start index(%d), term(%d), command(%v)\n", rf.me, index, term, command)
-	// }
 	return index, term, isLeader
 }
 
@@ -348,8 +335,6 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) convertFollower() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.state = Follower
 	rf.votedFor = -1
 }
@@ -363,13 +348,6 @@ func (rf *Raft) convertCandidate() {
 	rf.votedNum = 1
 }
 
-func (rf *Raft) convertLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.state = Leader
-	rf.votedFor = -1
-}
-
 func (rf *Raft) handleFollower() {
 	select {
 	case <-time.After(candidateTimeout()):
@@ -379,7 +357,6 @@ func (rf *Raft) handleFollower() {
 }
 
 func (rf *Raft) handleCandidate() {
-	//	fmt.Println("handleCandidate: ", rf.me)
 	rf.mu.Lock()
 	if rf.state != Candidate {
 		rf.mu.Unlock()
@@ -406,29 +383,26 @@ func (rf *Raft) handleCandidate() {
 			ok := rf.sendRequestVote(server, args, requestVoteReply)
 			if ok {
 				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				// 已经产生leader
 				if requestVoteReply.Term > rf.currentTerm {
-					rf.mu.Unlock()
 					rf.convertFollower()
 					rf.recvLeader <- struct{}{}
 					return
 				}
 				// 获取选票失败
 				if requestVoteReply.Term < rf.currentTerm || requestVoteReply.VoteGranted == false || rf.state != Candidate {
-					rf.mu.Unlock()
 					return
 				}
 				// 获取选票成功
 				if requestVoteReply.Term == rf.currentTerm && requestVoteReply.VoteGranted == true {
 					rf.votedNum += 1
 					if rf.getMostServiceVote() {
-						rf.mu.Unlock()
 						rf.convertLeader()
 						rf.recvLeader <- struct{}{}
 						return
 					}
 				}
-				rf.mu.Unlock()
 			}
 		}(i, requestVoteArgs)
 	}
@@ -439,21 +413,20 @@ func (rf *Raft) handleCandidate() {
 	}
 }
 
-func (rf *Raft) handleLeader() {
-	// fmt.Println("do leader worker : ", rf.me)
+func (rf *Raft) convertLeader() {
+	rf.state = Leader
+	rf.votedFor = -1
+
 	// 重新初始化nextIndex和matchIndex
-	rf.mu.Lock()
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
 		rf.matchIndex[i] = 0
 	}
-	rf.mu.Unlock()
+}
 
+func (rf *Raft) handleLeader() {
 	for {
 		rf.mu.Lock()
 		if rf.state != Leader {
@@ -474,7 +447,6 @@ func (rf *Raft) handleLeader() {
 						rf.mu.Unlock()
 						return
 					}
-
 					// 准备存储的日志条目
 					entries := make([]*logEntries, 0)
 					nextIndex := rf.nextIndex[server]
@@ -498,49 +470,62 @@ func (rf *Raft) handleLeader() {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
 
-						if reply.Success == false {
-							if reply.Term > rf.currentTerm {
-								rf.currentTerm = reply.Term
-								rf.mu.Unlock()
-								rf.convertFollower()
-								rf.mu.Lock()
-							} else {
-
-								newIndex := reply.ConflictIndex
-								for i := 0; i < len(rf.logs); i++ {
-									entry := rf.logs[i]
-									if entry.Term == reply.ConflictTerm {
-										newIndex = i + 1
-									}
-								}
-								rf.nextIndex[server] = newIndex
-								// fmt.Printf("sendAppendEntries log conflict %d, %d, newIndex:%d\n", reply.ConflictTerm, reply.ConflictIndex, newIndex)
-							}
-						} else {
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.convertFollower()
+							return
+						}
+						// 状态判断
+						if rf.state != Leader || rf.currentTerm != appendEntriesArgs.Term {
+							return
+						}
+						if reply.Success {
 							rf.matchIndex[server] = rf.lastLogIndex()
 							rf.nextIndex[server] = rf.lastLogIndex() + 1
-							N := rf.lastLogIndex()
-							for N > rf.commitIndex {
-								matchNums := 1
-								for j := 0; j < len(rf.peers); j++ {
-									if rf.matchIndex[j] >= N {
-										matchNums++
-									}
-									if matchNums >= len(rf.peers)/2+1 && rf.logs[N].Term == rf.currentTerm {
-										rf.commitIndex = N
-										// fmt.Println("go to commit : ", rf.me, N)
-										rf.commitCh <- struct{}{}
-										return
-									}
-								}
-								N--
-							}
+							rf.addCommitIndex()
+						} else {
+							rf.nextIndex[server] = rf.newAppendNextIndex(reply)
 						}
 					}
 				}(i)
 			}
 		}()
 		time.Sleep(heartBeatTime())
+	}
+}
+
+// 使跟随者的日志进入和自己一致的状态
+func (rf *Raft) newAppendNextIndex(reply *AppendEntriesReply) int {
+	newIndex := reply.ConflictIndex
+	for j := 1; j < len(rf.logs); j++ {
+		entry := rf.logs[j]
+		if entry.Term == reply.ConflictTerm {
+			newIndex = j + 1
+		}
+	}
+	if newIndex == 0 {
+		newIndex = 1
+	}
+	return newIndex
+}
+
+// 如果存在一个满足N > commitIndex的 N，并且大多数的matchIndex[i] ≥ N成立，
+// 并且log[N].term == currentTerm成立,那么令 commitIndex 等于这个 N
+func (rf *Raft) addCommitIndex() {
+	N := rf.lastLogIndex()
+	for N > rf.commitIndex {
+		matchNums := 1
+		for j := 0; j < len(rf.peers); j++ {
+			if rf.matchIndex[j] >= N {
+				matchNums++
+			}
+			if matchNums >= len(rf.peers)/2+1 && rf.logs[N].Term == rf.currentTerm {
+				rf.commitIndex = N
+				rf.commitCh <- struct{}{}
+				return
+			}
+		}
+		N--
 	}
 }
 
@@ -572,7 +557,6 @@ func (rf *Raft) persistLogs(applyCh chan ApplyMsg) {
 				Index:   log.Index,
 				Command: log.Command,
 			}
-			// fmt.Printf("(%d)persistLogs--  %v\n", rf.me, log.Command)
 		}
 		rf.mu.Unlock()
 	}
