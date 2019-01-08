@@ -117,17 +117,28 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("recv RequestVote server(%d) state(%d)", rf.me, rf.state)
-	reply.Term = rf.currentTerm
+	DPrintf("recv RequestVote server(%d) state(%d) term(%d)", rf.me, rf.state, args.Term)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		return
 	}
-	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		return
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.convertFollower()
 	}
-	lastLog := rf.logs[lastLogIndex(rf.logs)]
-	if (lastLog.term < args.LastLogTerm) || (lastLog.term == args.LastLogTerm && lastLog.index <= args.LastLogIndex) {
-		reply.VoteGranted = true
+
+	reply.Term = rf.currentTerm
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		lastLog := rf.logs[lastLogIndex(rf.logs)]
+		if (lastLog.term < args.LastLogTerm) || (lastLog.term == args.LastLogTerm && lastLog.index <= args.LastLogIndex) {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			rf.recvLeader <- struct{}{}
+		}
 	}
 	return
 }
@@ -171,16 +182,22 @@ type AppendEntriesReply struct {
 // send by leader for heartbeat and sync logs
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintf("AppendEntries server(%d), state(%d) term(%d) %v", rf.me, rf.state, args.Term, args)
-	rf.recvLeader <- struct{}{}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.convertFollower(args.Term)
+		rf.currentTerm = args.Term
+		// rf.convertFollower()
+		rf.state = Follower
 		reply.Success = true
+		reply.Term = rf.currentTerm
 	}
+
+	rf.recvLeader <- struct{}{}
 	return
 }
 
@@ -280,6 +297,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) run() {
 	DPrintf("Run server(%d), state(%d)", rf.me, rf.state)
+	rf.recvLeader = make(chan struct{}, 10)
 	for {
 		switch rf.state {
 		case Follower:
@@ -288,6 +306,8 @@ func (rf *Raft) run() {
 			rf.doCandidate()
 		case Leader:
 			rf.doLeader()
+		default:
+			panic("unknown raft state")
 		}
 	}
 }
@@ -299,7 +319,6 @@ func (rf *Raft) init() {
 	rf.logs[0] = &LogEntry{term: -1, index: -1}
 
 	rf.state = Follower
-	rf.recvLeader = make(chan struct{}, 1)
 }
 
 func (rf *Raft) doFollower() {
@@ -311,16 +330,17 @@ func (rf *Raft) doFollower() {
 	}
 }
 
-func (rf *Raft) convertFollower(currentTerm int) {
-	DPrintf("convertFollower newTerm (%d)", currentTerm)
+func (rf *Raft) convertFollower() {
 	rf.state = Follower
-	rf.currentTerm = currentTerm
 	rf.votedFor = -1
-	rf.voteNum = 0
 }
 
 func (rf *Raft) doCandidate() {
 	DPrintf("doCandidate: server(%d), state(%d)", rf.me, rf.state)
+
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+
 	// check server state
 	if rf.state != Candidate {
 		return
@@ -347,18 +367,21 @@ func (rf *Raft) doCandidate() {
 				return
 			}
 			if reply.Term > rf.currentTerm {
-				rf.convertFollower(reply.Term)
+				rf.convertFollower()
+				rf.recvLeader <- struct{}{}
 				return
 			}
 			if rf.state != Candidate {
 				return
 			}
-			rf.voteNum++
-			// change to leader
-			if rf.getMostVote() {
-				rf.convertLeader()
-				rf.recvLeader <- struct{}{}
-				return
+			if reply.VoteGranted && reply.Term == rf.currentTerm {
+				rf.voteNum++
+				// change to leader
+				if rf.getMostVote() {
+					rf.convertLeader()
+					rf.recvLeader <- struct{}{}
+					return
+				}
 			}
 		}(i)
 	}
@@ -379,6 +402,9 @@ func (rf *Raft) getMostVote() bool {
 
 func (rf *Raft) convertCandidate() {
 	DPrintf("convertCandidate: server(%d), state(%d)", rf.me, rf.state)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	rf.state = Candidate
 	rf.votedFor = rf.me
 	rf.voteNum = 1
@@ -387,6 +413,9 @@ func (rf *Raft) convertCandidate() {
 
 func (rf *Raft) doLeader() {
 	DPrintf("doLeader: server(%d), state(%d), term(%d)", rf.me, rf.state, rf.currentTerm)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	for {
 		if rf.state != Leader {
 			return
@@ -406,8 +435,12 @@ func (rf *Raft) doLeader() {
 						LeaderId: rf.me,
 					}
 					reply := &AppendEntriesReply{}
-					success := rf.sendAppendEntries(server, args, reply)
-					if !success {
+					ok := rf.sendAppendEntries(server, args, reply)
+					if !ok {
+						return
+					}
+					if reply.Term > rf.currentTerm {
+						rf.convertFollower()
 						return
 					}
 				}(i)
@@ -420,7 +453,7 @@ func (rf *Raft) doLeader() {
 func (rf *Raft) convertLeader() {
 	DPrintf("convertLeader server(%d)", rf.me)
 	rf.state = Leader
-	rf.votedFor = rf.me
+	rf.votedFor = -1
 	rf.voteNum = 0
 }
 
