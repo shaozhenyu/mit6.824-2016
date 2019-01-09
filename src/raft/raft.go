@@ -18,9 +18,9 @@ package raft
 //
 
 import (
-	// "fmt"
 	"bytes"
 	"encoding/gob"
+	// "fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -56,15 +56,7 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	var term int
-	var isleader bool
-	// Your code here.
-	term = rf.currentTerm
-	if rf.state == Leader {
-		isleader = true
-	}
-
-	return term, isleader
+	return rf.currentTerm, rf.state == Leader
 }
 
 //
@@ -115,10 +107,11 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("recv RequestVote server(%d) state(%d) term(%d)", rf.me, rf.state, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("recv RequestVote server(%d) state(%d) term(%d) cid(%d)", rf.me, rf.state, args.Term, args.CandidateId)
 
+	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
@@ -136,6 +129,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		if (lastLogTerm < args.LastLogTerm) || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
+			rf.persist()
 			rf.recvLeader <- struct{}{}
 		}
 	}
@@ -188,11 +182,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		reply.Term = rf.currentTerm
 	}()
 
+	reply.Success = false
 	if args.Term < rf.currentTerm {
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertFollower()
 		reply.Success = true
@@ -343,7 +338,7 @@ func (rf *Raft) sendMsg(applyCh chan ApplyMsg) {
 				Index:   log.Index,
 				Command: log.Command,
 			}
-			DPrintf("applied: %d", rf.lastApplied, log.Command)
+			DPrintf("applied: %d %v", rf.lastApplied, log.Command)
 		}
 		rf.mu.Unlock()
 	}
@@ -432,7 +427,7 @@ func (rf *Raft) doCandidate() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			defer rf.persist()
+			// defer rf.persist()
 
 			if reply.Term > rf.currentTerm {
 				rf.convertFollower()
@@ -576,15 +571,15 @@ func (rf *Raft) checkCommitIndex() {
 
 func (rf *Raft) convertLeader() {
 	DPrintf("convertLeader server(%d)", rf.me)
-	defer rf.persist()
+	// defer rf.persist()
 	rf.state = Leader
-	rf.votedFor = -1
-	rf.voteNum = 0
+	// rf.votedFor = -1
+	// rf.voteNum = 0
 }
 
 // heartbeat
 func electionTimeout() <-chan time.Time {
-	return time.After(time.Duration(300+rand.Int63()%200) * time.Millisecond)
+	return time.After(time.Duration(500+rand.Int63()%500) * time.Millisecond)
 }
 
 // func broadcastTime() <-chan time.Time {
