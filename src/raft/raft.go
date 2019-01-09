@@ -242,7 +242,6 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 
 	isLeader := (rf.state == Leader)
 	if isLeader {
@@ -251,6 +250,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    rf.currentTerm,
 			Command: command,
 		})
+		DPrintf("get log %d %d %v", rf.me, rf.lastLogIndex(), command)
+		rf.persist()
 	}
 	index := rf.lastLogIndex()
 	term := rf.currentTerm
@@ -338,7 +339,7 @@ func (rf *Raft) sendMsg(applyCh chan ApplyMsg) {
 				Index:   log.Index,
 				Command: log.Command,
 			}
-			DPrintf("applied: %d %v", rf.lastApplied, log.Command)
+			DPrintf("applied: server(%d) %d %v", rf.me, rf.lastApplied, log.Command)
 		}
 		rf.mu.Unlock()
 	}
@@ -505,6 +506,7 @@ func (rf *Raft) doLeader() {
 						rf.mu.Unlock()
 						return
 					}
+					// defer rf.mu.Unlock()
 
 					entries := make([]*LogEntry, 0)
 					nextIndex := rf.nextIndex[server]
@@ -540,8 +542,13 @@ func (rf *Raft) doLeader() {
 						return
 					}
 
-					rf.nextIndex[server] = rf.lastLogIndex() + 1
-					rf.matchIndex[server] = rf.lastLogIndex()
+					if rf.state != Leader {
+						return
+					}
+
+					// if leader's log has append when send broadcast
+					rf.nextIndex[server] = args.PrevLogIndex + len(entries) + 1
+					rf.matchIndex[server] = args.PrevLogIndex + len(entries)
 					rf.checkCommitIndex()
 				}(i)
 			}
