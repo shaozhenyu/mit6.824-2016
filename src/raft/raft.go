@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	// "fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -186,15 +187,43 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm {
+	defer func() {
 		reply.Term = rf.currentTerm
+	}()
+
+	if args.Term < rf.currentTerm {
 		return
 	}
+
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertFollower()
 		reply.Success = true
-		reply.Term = rf.currentTerm
+	}
+
+	// log not match
+	if len(rf.logs) <= args.PrevLogIndex {
+		reply.Success = false
+		rf.recvLeader <- struct{}{}
+		return
+	}
+
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		rf.recvLeader <- struct{}{}
+		return
+	}
+	reply.Success = true
+	// delete conflict log and add new log
+	if len(args.Entries) > 0 {
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = append(rf.logs, args.Entries...)
+	}
+
+	// update server commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
+		rf.commitCh <- struct{}{}
 	}
 
 	rf.recvLeader <- struct{}{}
@@ -230,7 +259,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 	}
 	index := rf.lastLogIndex()
-	term := rf.lastLogTerm()
+	term := rf.currentTerm
 	return index, term, isLeader
 }
 
@@ -272,6 +301,7 @@ type Raft struct {
 
 	state      RaftState     // raft server state
 	recvLeader chan struct{} // recv leader's requset
+	commitCh   chan struct{} // recv commit
 	voteNum    int
 }
 
@@ -296,11 +326,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here.
 	rf.init()
 	go rf.run()
+	go rf.sendMsg(applyCh)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+func (rf *Raft) sendMsg(applyCh chan ApplyMsg) {
+	for range rf.commitCh {
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			log := rf.logs[rf.lastApplied]
+			applyCh <- ApplyMsg{
+				Index:   log.Index,
+				Command: log.Command,
+			}
+			DPrintf("applied: %d", rf.lastApplied, log.Command)
+		}
+		rf.mu.Unlock()
+	}
 }
 
 func (rf *Raft) run() {
@@ -321,12 +368,16 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) init() {
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.logs = make([]*LogEntry, 1, 4096)
 	rf.logs[0] = &LogEntry{Term: 0, Index: 0}
 
 	rf.state = Follower
+	rf.commitCh = make(chan struct{}, 10)
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -479,10 +530,37 @@ func (rf *Raft) doLeader() {
 						rf.convertFollower()
 						return
 					}
+
+					if !reply.Success {
+						rf.nextIndex[server]--
+						return
+					}
+
+					rf.nextIndex[server] = rf.lastLogIndex() + 1
+					rf.matchIndex[server] = rf.lastLogIndex()
+					rf.checkCommitIndex()
 				}(i)
 			}
 		}()
 		<-broadcastTime()
+	}
+}
+
+func (rf *Raft) checkCommitIndex() {
+	N := rf.lastLogIndex()
+	for N > rf.commitIndex {
+		matchNum := 1
+		for i := 0; i < len(rf.peers); i++ {
+			if rf.matchIndex[i] >= N && rf.logs[N].Term == rf.currentTerm {
+				matchNum++
+				if matchNum >= len(rf.peers)/2+1 {
+					rf.commitIndex = N
+					rf.commitCh <- struct{}{}
+					return
+				}
+			}
+		}
+		N--
 	}
 }
 
@@ -516,4 +594,11 @@ func (rf *Raft) lastLogIndex() int {
 func (rf *Raft) lastLogTerm() int {
 	logs := rf.logs
 	return logs[len(logs)-1].Term
+}
+
+func min(x, y int) int {
+	if x <= y {
+		return x
+	}
+	return y
 }
