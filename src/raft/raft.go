@@ -55,7 +55,6 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here.
@@ -191,14 +190,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		// rf.convertFollower()
-		rf.state = Follower
+		rf.convertFollower()
 		reply.Success = true
 		reply.Term = rf.currentTerm
 	}
 
 	rf.recvLeader <- struct{}{}
-	return
 }
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -338,34 +335,38 @@ func (rf *Raft) convertFollower() {
 func (rf *Raft) doCandidate() {
 	DPrintf("doCandidate: server(%d), state(%d)", rf.me, rf.state)
 
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
-
-	// check server state
+	rf.mu.Lock()
 	if rf.state != Candidate {
+		rf.mu.Unlock()
 		return
 	}
+	rf.mu.Unlock()
 
 	// send request vote for all server
-	reqVoteArgs := RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: rf.logs[lastLogIndex(rf.logs)].index,
-		LastLogTerm:  rf.logs[lastLogIndex(rf.logs)].term,
-	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		if rf.state != Candidate {
-			return
+
+		rf.mu.Lock()
+		reqVoteArgs := RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: rf.logs[lastLogIndex(rf.logs)].index,
+			LastLogTerm:  rf.logs[lastLogIndex(rf.logs)].term,
 		}
+		rf.mu.Unlock()
+
 		go func(server int) {
+
 			reply := &RequestVoteReply{}
 			ok := rf.sendRequestVote(server, reqVoteArgs, reply)
 			if !ok {
 				return
 			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if reply.Term > rf.currentTerm {
 				rf.convertFollower()
 				rf.recvLeader <- struct{}{}
