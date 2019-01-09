@@ -48,8 +48,9 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term  int
-	index int
+	Term    int
+	Index   int
+	Command interface{}
 }
 
 // return currentTerm and whether this server
@@ -132,8 +133,9 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		lastLog := rf.logs[lastLogIndex(rf.logs)]
-		if (lastLog.term < args.LastLogTerm) || (lastLog.term == args.LastLogTerm && lastLog.index <= args.LastLogIndex) {
+		lastLogIndex := rf.lastLogIndex()
+		lastLogTerm := rf.lastLogTerm()
+		if (lastLogTerm < args.LastLogTerm) || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			rf.recvLeader <- struct{}{}
@@ -165,12 +167,12 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-	// PrevLogIndex int
-	// PrevLogTerm  int
-	// Entries      []*LogEntry
-	// LeaderCommit int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []*LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -216,10 +218,19 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	isLeader := (rf.state == Leader)
+	if isLeader {
+		rf.logs = append(rf.logs, &LogEntry{
+			Index:   rf.lastLogIndex() + 1,
+			Term:    rf.currentTerm,
+			Command: command,
+		})
+	}
+	index := rf.lastLogIndex()
+	term := rf.lastLogTerm()
 	return index, term, isLeader
 }
 
@@ -256,8 +267,8 @@ type Raft struct {
 	lastApplied int
 
 	// change frequently on leader
-	nextIndex  []*LogEntry
-	matchIndex []*LogEntry
+	nextIndex  []int
+	matchIndex []int
 
 	state      RaftState     // raft server state
 	recvLeader chan struct{} // recv leader's requset
@@ -313,9 +324,12 @@ func (rf *Raft) init() {
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.logs = make([]*LogEntry, 1, 4096)
-	rf.logs[0] = &LogEntry{term: -1, index: -1}
+	rf.logs[0] = &LogEntry{Term: 0, Index: 0}
 
 	rf.state = Follower
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 }
 
 func (rf *Raft) doFollower() {
@@ -352,8 +366,8 @@ func (rf *Raft) doCandidate() {
 		reqVoteArgs := RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
-			LastLogIndex: rf.logs[lastLogIndex(rf.logs)].index,
-			LastLogTerm:  rf.logs[lastLogIndex(rf.logs)].term,
+			LastLogIndex: rf.lastLogIndex(),
+			LastLogTerm:  rf.lastLogTerm(),
 		}
 		rf.mu.Unlock()
 
@@ -367,6 +381,7 @@ func (rf *Raft) doCandidate() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+
 			if reply.Term > rf.currentTerm {
 				rf.convertFollower()
 				rf.recvLeader <- struct{}{}
@@ -414,32 +429,52 @@ func (rf *Raft) convertCandidate() {
 
 func (rf *Raft) doLeader() {
 	DPrintf("doLeader: server(%d), state(%d), term(%d)", rf.me, rf.state, rf.currentTerm)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	for {
+		// check state
+		rf.mu.Lock()
 		if rf.state != Leader {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
+
 		go func() {
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
-				if rf.state != Leader {
-					break
-				}
 
 				go func(server int) {
-					args := AppendEntriesArgs{
-						Term:     rf.currentTerm,
-						LeaderId: rf.me,
+					rf.mu.Lock()
+					if rf.state != Leader {
+						rf.mu.Unlock()
+						return
 					}
+
+					entries := make([]*LogEntry, 0)
+					nextIndex := rf.nextIndex[server]
+					if len(rf.logs) >= nextIndex {
+						entries = rf.logs[nextIndex:]
+					}
+					args := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: nextIndex - 1,
+						PrevLogTerm:  rf.logs[nextIndex-1].Term,
+						Entries:      entries,
+						LeaderCommit: rf.commitIndex,
+					}
+					rf.mu.Unlock()
+
 					reply := &AppendEntriesReply{}
 					ok := rf.sendAppendEntries(server, args, reply)
 					if !ok {
 						return
 					}
+
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+
 					if reply.Term > rf.currentTerm {
 						rf.convertFollower()
 						return
@@ -456,6 +491,12 @@ func (rf *Raft) convertLeader() {
 	rf.state = Leader
 	rf.votedFor = -1
 	rf.voteNum = 0
+
+	// init nextIndex and matchIndex
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = rf.lastLogIndex() + 1
+		rf.matchIndex[i] = 0
+	}
 }
 
 // heartbeat
@@ -467,6 +508,12 @@ func broadcastTime() <-chan time.Time {
 	return time.After(10 * time.Millisecond)
 }
 
-func lastLogIndex(logs []*LogEntry) int {
-	return len(logs) - 1
+func (rf *Raft) lastLogIndex() int {
+	logs := rf.logs
+	return logs[len(logs)-1].Index
+}
+
+func (rf *Raft) lastLogTerm() int {
+	logs := rf.logs
+	return logs[len(logs)-1].Term
 }
