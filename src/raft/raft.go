@@ -579,11 +579,11 @@ func (rf *Raft) convertLeader() {
 
 // heartbeat
 func electionTimeout() <-chan time.Time {
-	return time.After(time.Duration(100+rand.Int63()%400) * time.Millisecond)
+	return time.After(time.Duration(300+rand.Int63()%200) * time.Millisecond)
 }
 
 func broadcastTime() <-chan time.Time {
-	return time.After(10 * time.Millisecond)
+	return time.After(50 * time.Millisecond)
 }
 
 func (rf *Raft) lastLogIndex() int {
