@@ -20,7 +20,6 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
-	// "fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -56,6 +55,8 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.state == Leader
 }
 
@@ -109,7 +110,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("recv RequestVote server(%d) state(%d) term(%d) cid(%d)", rf.me, rf.state, args.Term, args.CandidateId)
+	DPrintf("recv RequestVote server(%d) state(%d) term(%d) votedFor(%d) || term(%d) cid(%d)", rf.me, rf.state, rf.currentTerm, rf.votedFor,
+		args.Term, args.CandidateId)
 
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
@@ -170,13 +172,16 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // send by leader for heartbeat and sync logs
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("AppendEntries server(%d), state(%d) term(%d) %v", rf.me, rf.state, args.Term, args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// DPrintf("AppendEntries server(%d), state(%d) term(%d) %v", rf.me, rf.state, args.Term, args)
 
 	defer func() {
 		reply.Term = rf.currentTerm
@@ -187,24 +192,39 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	if args.Term >= rf.currentTerm {
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertFollower()
 		reply.Success = true
 	}
+	if args.Term == rf.currentTerm {
+		reply.Success = true
+		rf.state = Follower
+	}
 
-	// log not match
+	// log not match, find the conflict index
 	if len(rf.logs) <= args.PrevLogIndex {
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = rf.lastLogTerm()
+
+		reply.Success = false
+		rf.recvLeader <- struct{}{}
+		return
+	}
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			if rf.logs[i].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i + 1
+				break
+			}
+		}
+
 		reply.Success = false
 		rf.recvLeader <- struct{}{}
 		return
 	}
 
-	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
-		rf.recvLeader <- struct{}{}
-		return
-	}
 	reply.Success = true
 	// delete conflict log and add new log
 	if len(args.Entries) > 0 {
@@ -250,7 +270,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    rf.currentTerm,
 			Command: command,
 		})
-		DPrintf("get log %d %d %v", rf.me, rf.lastLogIndex(), command)
+		DPrintf("get log server(%d) term(%d) index(%d) command(%v)", rf.me, rf.currentTerm, rf.lastLogIndex(), command)
 		rf.persist()
 	}
 	index := rf.lastLogIndex()
@@ -347,7 +367,6 @@ func (rf *Raft) sendMsg(applyCh chan ApplyMsg) {
 
 func (rf *Raft) run() {
 	DPrintf("Run server(%d), state(%d)", rf.me, rf.state)
-	rf.recvLeader = make(chan struct{}, 10)
 	for {
 		switch rf.state {
 		case Follower:
@@ -373,6 +392,7 @@ func (rf *Raft) init() {
 
 	rf.state = Follower
 	rf.commitCh = make(chan struct{}, 10)
+	rf.recvLeader = make(chan struct{}, 10)
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -395,7 +415,6 @@ func (rf *Raft) convertFollower() {
 
 func (rf *Raft) doCandidate() {
 	DPrintf("doCandidate: server(%d), state(%d)", rf.me, rf.state)
-
 	rf.mu.Lock()
 	if rf.state != Candidate {
 		rf.mu.Unlock()
@@ -428,7 +447,6 @@ func (rf *Raft) doCandidate() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			// defer rf.persist()
 
 			if reply.Term > rf.currentTerm {
 				rf.convertFollower()
@@ -537,12 +555,13 @@ func (rf *Raft) doLeader() {
 						return
 					}
 
-					if !reply.Success {
-						rf.nextIndex[server]--
+					// check rf now term == pre send term
+					if rf.state != Leader || reply.Term != rf.currentTerm {
 						return
 					}
 
-					if rf.state != Leader {
+					if !reply.Success {
+						rf.nextIndex[server] = reply.ConflictIndex
 						return
 					}
 
