@@ -197,6 +197,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.convertFollower()
 		reply.Success = true
 	}
+
+	// should not to update server votedFor
 	if args.Term == rf.currentTerm {
 		reply.Success = true
 		rf.state = Follower
