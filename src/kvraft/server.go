@@ -17,11 +17,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key         string
+	Value       string
+	OperateType string
+	ReqID       int64
 }
 
 type RaftKV struct {
@@ -33,11 +36,34 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	reqID      int64
+	commitChan map[int]chan Op
+	data       map[string]string
 }
 
+func (kv *RaftKV) AppendLog(command interface{}) {
+
+}
+
+func newOp(key, value string, opType string, reqID int64) *Op {
+	return &Op{
+		Key:         key,
+		Value:       value,
+		OperateType: opType,
+		ReqID:       reqID,
+	}
+}
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	_, ok := kv.rf.GetState()
+	if !ok {
+		reply.WrongLeader = true
+	} else {
+		kv.mu.Lock()
+		kv.reqID++
+		op := newOp(args.Key, "", "Get", kv.reqID)
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -82,6 +108,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-
 	return kv
+}
+
+func (kv *RaftKV) recvApply() {
+
 }
