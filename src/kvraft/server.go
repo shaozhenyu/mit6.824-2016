@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -36,17 +37,13 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	reqID      int64
-	commitChan map[int]chan Op
-	data       map[string]string
+	reqID     int64
+	applyChan map[int64]chan Op
+	data      map[string]string
 }
 
-func (kv *RaftKV) AppendLog(command interface{}) {
-
-}
-
-func newOp(key, value string, opType string, reqID int64) *Op {
-	return &Op{
+func newOp(key, value string, opType string, reqID int64) Op {
+	return Op{
 		Key:         key,
 		Value:       value,
 		OperateType: opType,
@@ -62,12 +59,51 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Lock()
 		kv.reqID++
 		op := newOp(args.Key, "", "Get", kv.reqID)
+		kv.applyChan[kv.reqID] = make(chan Op, 1)
 		kv.mu.Unlock()
+
+		_, _, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			reply.WrongLeader = true
+			return
+		}
+
+		var rspOp Op
+		select {
+		case rspOp = <-kv.applyChan[kv.reqID]:
+			reply.Value = rspOp.Value
+		case <-time.After(1 * time.Second):
+			DPrintf("get timeout")
+			reply.Err = "request timeout"
+		}
 	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	_, ok := kv.rf.GetState()
+	if !ok {
+		reply.WrongLeader = true
+	} else {
+		kv.mu.Lock()
+		kv.reqID++
+		op := newOp(args.Key, args.Value, args.Op, kv.reqID)
+		kv.applyChan[kv.reqID] = make(chan Op, 1)
+		kv.mu.Unlock()
+
+		_, _, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			reply.WrongLeader = true
+			return
+		}
+
+		select {
+		case <-kv.applyChan[kv.reqID]:
+		case <-time.After(1 * time.Second):
+			DPrintf("PutAppend timeout")
+			reply.Err = "request timeout"
+		}
+	}
 }
 
 //
@@ -104,13 +140,37 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// Your initialization code here.
+	kv.applyChan = make(map[int64]chan Op)
+	kv.data = make(map[string]string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	go kv.recvApply()
 
 	return kv
 }
 
 func (kv *RaftKV) recvApply() {
+	for applyMsg := range kv.applyCh {
+		DPrintf("recvApply %v %v", applyMsg, applyMsg.Command)
+		go kv.handleAppledCommand(applyMsg)
+	}
+}
 
+func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	op, _ := msg.Command.(Op)
+	DPrintf("op:%v, data:%v", op, kv.data)
+	switch op.OperateType {
+	case "Get":
+		op.Value = kv.data[op.Key]
+	case "Put":
+		kv.data[op.Key] = op.Value
+	case "Append":
+		kv.data[op.Key] += op.Value
+	}
+	kv.applyChan[op.ReqID] <- op
 }
