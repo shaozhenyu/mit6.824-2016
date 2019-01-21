@@ -58,10 +58,12 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	} else {
 		kv.mu.Lock()
 		kv.reqID++
-		op := newOp(args.Key, "", "Get", kv.reqID)
-		kv.applyChan[kv.reqID] = make(chan Op, 1)
+		reqID := kv.reqID
+		kv.applyChan[reqID] = make(chan Op, 1)
+		rsp := kv.applyChan[reqID]
 		kv.mu.Unlock()
 
+		op := newOp(args.Key, "", "Get", reqID)
 		_, _, isLeader := kv.rf.Start(op)
 		if !isLeader {
 			reply.WrongLeader = true
@@ -70,7 +72,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 		var rspOp Op
 		select {
-		case rspOp = <-kv.applyChan[kv.reqID]:
+		case rspOp = <-rsp:
 			reply.Value = rspOp.Value
 		case <-time.After(1 * time.Second):
 			DPrintf("get timeout")
@@ -87,10 +89,12 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else {
 		kv.mu.Lock()
 		kv.reqID++
-		op := newOp(args.Key, args.Value, args.Op, kv.reqID)
-		kv.applyChan[kv.reqID] = make(chan Op, 1)
+		reqID := kv.reqID
+		kv.applyChan[reqID] = make(chan Op, 1)
+		rsp := kv.applyChan[reqID]
 		kv.mu.Unlock()
 
+		op := newOp(args.Key, args.Value, args.Op, reqID)
 		_, _, isLeader := kv.rf.Start(op)
 		if !isLeader {
 			reply.WrongLeader = true
@@ -98,7 +102,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 
 		select {
-		case <-kv.applyChan[kv.reqID]:
+		case <-rsp:
 		case <-time.After(1 * time.Second):
 			DPrintf("PutAppend timeout")
 			reply.Err = "request timeout"

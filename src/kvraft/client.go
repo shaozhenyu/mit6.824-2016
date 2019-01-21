@@ -87,7 +87,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			return
 		}
 	}
-
 }
 
 func (ck *Clerk) Put(key string, value string) {
