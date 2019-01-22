@@ -26,6 +26,10 @@ type Op struct {
 	Value       string
 	OperateType string
 	ReqID       int64
+
+	// check client req
+	ClientID  int64
+	ClientReq int64
 }
 
 type RaftKV struct {
@@ -38,16 +42,21 @@ type RaftKV struct {
 
 	// Your definitions here.
 	reqID     int64
-	applyChan map[int64]chan Op
+	applyChan map[int]chan Op
 	data      map[string]string
+
+	// applyed client reqest
+	applyCliReq map[int64]map[int64]struct{}
 }
 
-func newOp(key, value string, opType string, reqID int64) Op {
+func newOp(key, value string, opType string, reqID, clientID, clientReq int64) Op {
 	return Op{
 		Key:         key,
 		Value:       value,
 		OperateType: opType,
 		ReqID:       reqID,
+		ClientID:    clientID,
+		ClientReq:   clientReq,
 	}
 }
 
@@ -56,55 +65,59 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	if !ok {
 		reply.WrongLeader = true
 	} else {
-		kv.mu.Lock()
-		kv.reqID++
-		reqID := kv.reqID
-		kv.applyChan[reqID] = make(chan Op, 1)
-		rsp := kv.applyChan[reqID]
-		kv.mu.Unlock()
-
-		op := newOp(args.Key, "", "Get", reqID)
-		_, _, isLeader := kv.rf.Start(op)
+		op := newOp(args.Key, "", "Get", 0, args.ClientID, args.ReqID)
+		index, _, isLeader := kv.rf.Start(op)
 		if !isLeader {
 			reply.WrongLeader = true
 			return
 		}
 
+		kv.mu.Lock()
+		if _, ok := kv.applyChan[index]; !ok {
+			kv.applyChan[index] = make(chan Op, 1)
+		}
+		rsp := kv.applyChan[index]
+		kv.mu.Unlock()
+
 		var rspOp Op
 		select {
 		case rspOp = <-rsp:
+			if rspOp.ClientID != op.ClientID || rspOp.ClientReq != op.ClientReq {
+				reply.Err = "request error"
+			}
 			reply.Value = rspOp.Value
 		case <-time.After(1 * time.Second):
-			DPrintf("get timeout")
 			reply.Err = "request timeout"
 		}
 	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
 	_, ok := kv.rf.GetState()
 	if !ok {
 		reply.WrongLeader = true
 	} else {
-		kv.mu.Lock()
-		kv.reqID++
-		reqID := kv.reqID
-		kv.applyChan[reqID] = make(chan Op, 1)
-		rsp := kv.applyChan[reqID]
-		kv.mu.Unlock()
-
-		op := newOp(args.Key, args.Value, args.Op, reqID)
-		_, _, isLeader := kv.rf.Start(op)
+		op := newOp(args.Key, args.Value, args.Op, 0, args.ClientID, args.ReqID)
+		index, _, isLeader := kv.rf.Start(op)
 		if !isLeader {
 			reply.WrongLeader = true
 			return
 		}
 
+		kv.mu.Lock()
+		if _, ok := kv.applyChan[index]; !ok {
+			kv.applyChan[index] = make(chan Op, 1)
+		}
+		rsp := kv.applyChan[index]
+		kv.mu.Unlock()
+
+		var rspOp Op
 		select {
-		case <-rsp:
+		case rspOp = <-rsp:
+			if rspOp != op {
+				reply.Err = "request error"
+			}
 		case <-time.After(1 * time.Second):
-			DPrintf("PutAppend timeout")
 			reply.Err = "request timeout"
 		}
 	}
@@ -144,11 +157,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// Your initialization code here.
-	kv.applyChan = make(map[int64]chan Op)
+	kv.applyChan = make(map[int]chan Op, 100)
 	kv.data = make(map[string]string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.applyCliReq = make(map[int64]map[int64]struct{})
 
 	go kv.recvApply()
 
@@ -157,8 +172,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 func (kv *RaftKV) recvApply() {
 	for applyMsg := range kv.applyCh {
-		DPrintf("recvApply %v %v", applyMsg, applyMsg.Command)
-		go kv.handleAppledCommand(applyMsg)
+		kv.handleAppledCommand(applyMsg)
 	}
 }
 
@@ -166,8 +180,27 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	index := msg.Index
 	op, _ := msg.Command.(Op)
-	DPrintf("op:%v, data:%v", op, kv.data)
+	// defer func() {
+	// 	DPrintf("server|%d| index|%d| op|%v|", kv.me, index, op)
+	// }()
+	if _, ok := kv.applyCliReq[op.ClientID]; ok {
+		if _, ok := kv.applyCliReq[op.ClientID][op.ClientReq]; ok {
+			if op.OperateType == "Get" {
+				op.Value = kv.data[op.Key]
+			}
+			if _, ok := kv.applyChan[index]; ok {
+				select {
+				case <-kv.applyChan[index]:
+				default:
+				}
+				kv.applyChan[index] <- op
+			}
+			return
+		}
+	}
+	// DPrintf("%d -- op:%v, data:%v", kv.me, op, kv.data)
 	switch op.OperateType {
 	case "Get":
 		op.Value = kv.data[op.Key]
@@ -176,5 +209,16 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 	case "Append":
 		kv.data[op.Key] += op.Value
 	}
-	kv.applyChan[op.ReqID] <- op
+	if _, ok := kv.applyCliReq[op.ClientID]; !ok {
+		kv.applyCliReq[op.ClientID] = make(map[int64]struct{})
+	}
+	kv.applyCliReq[op.ClientID][op.ClientReq] = struct{}{}
+
+	if _, ok := kv.applyChan[index]; ok {
+		select {
+		case <-kv.applyChan[index]:
+		default:
+		}
+		kv.applyChan[index] <- op
+	}
 }

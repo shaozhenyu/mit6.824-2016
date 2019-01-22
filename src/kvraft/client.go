@@ -1,12 +1,17 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"sync"
+)
 
 type Clerk struct {
+	mu      sync.Mutex
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	id      int64
+	reqID   int64
 }
 
 func nrand() int64 {
@@ -20,6 +25,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.id = nrand()
+	ck.reqID = 0
 	return ck
 }
 
@@ -36,10 +43,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	DPrintf("Get : |%s|", key)
-	args := &GetArgs{
-		Key: key,
-	}
+	args := &GetArgs{Key: key, ClientID: ck.id}
+	ck.mu.Lock()
+	ck.reqID++
+	args.ReqID = ck.reqID
+	ck.mu.Unlock()
+
+	// DPrintf("Get : clientID:|%d| req|%d| key|%s|", ck.id, args.ReqID, key)
 	for {
 		for i := 0; i < len(ck.servers); i++ {
 			reply := &GetReply{}
@@ -50,6 +60,7 @@ func (ck *Clerk) Get(key string) string {
 			if reply.Err != "" || reply.WrongLeader {
 				continue
 			}
+			// DPrintf("GET-------|%v|--|%s|", args, reply.Value)
 			return reply.Value
 		}
 	}
@@ -68,13 +79,18 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	DPrintf("PutAppend: |%s| |%s| |%s|", key, value, op)
 	args := &PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientID: ck.id,
 	}
+	ck.mu.Lock()
+	ck.reqID++
+	args.ReqID = ck.reqID
+	ck.mu.Unlock()
 	for {
+		// DPrintf("PutAppend: clientID:|%d| req|%d| |%s| |%s| |%s|", ck.id, args.ReqID, key, value, op)
 		for i := 0; i < len(ck.servers); i++ {
 			reply := &PutAppendReply{}
 			ok := ck.servers[i].Call("RaftKV.PutAppend", args, reply)
@@ -84,6 +100,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			if reply.Err != "" || reply.WrongLeader {
 				continue
 			}
+			DPrintf("PutAppend success: clientID:|%d| req|%d| |%s| |%s| |%s| |%v|", ck.id, args.ReqID, key, value, op, reply)
 			return
 		}
 	}
@@ -92,6 +109,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
+
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }
