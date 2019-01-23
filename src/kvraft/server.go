@@ -60,6 +60,13 @@ func newOp(key, value string, opType string, reqID, clientID, clientReq int64) O
 	}
 }
 
+func checkRspConsistent(req, rsp Op) bool {
+	if req.ClientID != rsp.ClientID || req.ClientReq != rsp.ClientReq {
+		return false
+	}
+	return true
+}
+
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	_, ok := kv.rf.GetState()
 	if !ok {
@@ -82,7 +89,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		var rspOp Op
 		select {
 		case rspOp = <-rsp:
-			if rspOp.ClientID != op.ClientID || rspOp.ClientReq != op.ClientReq {
+			if !checkRspConsistent(op, rspOp) {
 				reply.Err = "request error"
 			}
 			reply.Value = rspOp.Value
@@ -114,7 +121,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		var rspOp Op
 		select {
 		case rspOp = <-rsp:
-			if rspOp != op {
+			if !checkRspConsistent(op, rspOp) {
 				reply.Err = "request error"
 			}
 		case <-time.After(1 * time.Second):
@@ -182,20 +189,21 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 
 	index := msg.Index
 	op, _ := msg.Command.(Op)
-	// defer func() {
-	// 	DPrintf("server|%d| index|%d| op|%v|", kv.me, index, op)
-	// }()
+
+	defer func() {
+		if _, ok := kv.applyChan[index]; ok {
+			select {
+			case <-kv.applyChan[index]:
+			default:
+			}
+			kv.applyChan[index] <- op
+		}
+	}()
+
 	if _, ok := kv.applyCliReq[op.ClientID]; ok {
 		if _, ok := kv.applyCliReq[op.ClientID][op.ClientReq]; ok {
 			if op.OperateType == "Get" {
 				op.Value = kv.data[op.Key]
-			}
-			if _, ok := kv.applyChan[index]; ok {
-				select {
-				case <-kv.applyChan[index]:
-				default:
-				}
-				kv.applyChan[index] <- op
 			}
 			return
 		}
@@ -209,16 +217,9 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 	case "Append":
 		kv.data[op.Key] += op.Value
 	}
+
 	if _, ok := kv.applyCliReq[op.ClientID]; !ok {
 		kv.applyCliReq[op.ClientID] = make(map[int64]struct{})
 	}
 	kv.applyCliReq[op.ClientID][op.ClientReq] = struct{}{}
-
-	if _, ok := kv.applyChan[index]; ok {
-		select {
-		case <-kv.applyChan[index]:
-		default:
-		}
-		kv.applyChan[index] <- op
-	}
 }

@@ -8,10 +8,11 @@ import (
 )
 
 type Clerk struct {
-	mu      sync.Mutex
-	servers []*labrpc.ClientEnd
-	id      int64
-	reqID   int64
+	mu        sync.Mutex
+	servers   []*labrpc.ClientEnd
+	id        int64
+	reqID     int64
+	leaderIdx int
 }
 
 func nrand() int64 {
@@ -27,6 +28,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.id = nrand()
 	ck.reqID = 0
+	ck.leaderIdx = -1
 	return ck
 }
 
@@ -51,21 +53,37 @@ func (ck *Clerk) Get(key string) string {
 
 	// DPrintf("Get : clientID:|%d| req|%d| key|%s|", ck.id, args.ReqID, key)
 	for {
-		for i := 0; i < len(ck.servers); i++ {
-			reply := &GetReply{}
-			ok := ck.servers[i].Call("RaftKV.Get", args, reply)
-			if !ok {
-				continue
+		if ck.leaderIdx != -1 {
+			ok, value := ck.get(args, ck.leaderIdx)
+			if ok {
+				return value
 			}
-			if reply.Err != "" || reply.WrongLeader {
-				continue
+		} else {
+			for i := 0; i < len(ck.servers); i++ {
+				ok, value := ck.get(args, i)
+				if ok {
+					return value
+				}
 			}
-			// DPrintf("GET-------|%v|--|%s|", args, reply.Value)
-			return reply.Value
 		}
 	}
-
 	return ""
+}
+
+func (ck *Clerk) get(args *GetArgs, server int) (ok bool, val string) {
+	reply := &GetReply{}
+	ok = ck.servers[server].Call("RaftKV.Get", args, reply)
+	if reply.WrongLeader {
+		ck.updateLeaderIdx(-1)
+		ok = false
+	} else {
+		ck.updateLeaderIdx(server)
+	}
+	if reply.Err != "" {
+		ok = false
+	}
+	val = reply.Value
+	return
 }
 
 //
@@ -89,21 +107,43 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.reqID++
 	args.ReqID = ck.reqID
 	ck.mu.Unlock()
+
 	for {
-		// DPrintf("PutAppend: clientID:|%d| req|%d| |%s| |%s| |%s|", ck.id, args.ReqID, key, value, op)
-		for i := 0; i < len(ck.servers); i++ {
-			reply := &PutAppendReply{}
-			ok := ck.servers[i].Call("RaftKV.PutAppend", args, reply)
-			if !ok {
-				continue
+		if ck.leaderIdx != -1 {
+			ok := ck.putAppend(args, ck.leaderIdx)
+			if ok {
+				return
 			}
-			if reply.Err != "" || reply.WrongLeader {
-				continue
+		} else {
+			for i := 0; i < len(ck.servers); i++ {
+				ok := ck.putAppend(args, i)
+				if ok {
+					return
+				}
 			}
-			DPrintf("PutAppend success: clientID:|%d| req|%d| |%s| |%s| |%s| |%v|", ck.id, args.ReqID, key, value, op, reply)
-			return
 		}
 	}
+}
+
+func (ck *Clerk) putAppend(args *PutAppendArgs, server int) (ok bool) {
+	reply := &PutAppendReply{}
+	ok = ck.servers[server].Call("RaftKV.PutAppend", args, reply)
+	if reply.WrongLeader {
+		ck.updateLeaderIdx(-1)
+		ok = false
+	} else {
+		ck.updateLeaderIdx(server)
+	}
+	if reply.Err != "" {
+		ok = false
+	}
+	return
+}
+
+func (ck *Clerk) updateLeaderIdx(idx int) {
+	ck.mu.Lock()
+	ck.leaderIdx = idx
+	ck.mu.Unlock()
 }
 
 func (ck *Clerk) Put(key string, value string) {
