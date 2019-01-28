@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"labrpc"
 	"log"
@@ -9,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -174,6 +175,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	go kv.recvApply()
 
+	// if kv.maxraftstate != -1 {
+	// 	go kv.doSnapshot()
+	// }
+
 	return kv
 }
 
@@ -186,11 +191,20 @@ func (kv *RaftKV) recvApply() {
 func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	// DPrintf("server(%v) data(%v)", kv.me, kv.data)
+
+	if msg.UseSnapshot {
+		DPrintf("server(%d)read snapshot", kv.me)
+		kv.readSnapshot(msg.Snapshot)
+		return
+	}
 
 	index := msg.Index
 	op, _ := msg.Command.(Op)
 
+	DPrintf("index == (%d)", index)
 	defer func() {
+		kv.sendSnapshot(index)
 		if _, ok := kv.applyChan[index]; ok {
 			select {
 			case <-kv.applyChan[index]:
@@ -222,4 +236,28 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 		kv.applyCliReq[op.ClientID] = make(map[int64]struct{})
 	}
 	kv.applyCliReq[op.ClientID][op.ClientReq] = struct{}{}
+}
+
+func (kv *RaftKV) sendSnapshot(index int) {
+	if kv.maxraftstate == -1 || kv.rf.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.applyCliReq)
+	kv.rf.DoSnapshot(w.Bytes(), index)
+}
+
+func (kv *RaftKV) readSnapshot(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	if kv.data == nil {
+		kv.data = make(map[string]string)
+	}
+	d.Decode(&kv.data)
+	if kv.applyCliReq == nil {
+		kv.applyCliReq = make(map[int64]map[int64]struct{})
+	}
+	d.Decode(&kv.applyCliReq)
 }
