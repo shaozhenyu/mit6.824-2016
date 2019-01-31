@@ -20,7 +20,6 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -56,8 +55,6 @@ func (rf *Raft) InstallSnapshot(args SnapshotArgs, reply *SnapshotReply) {
 		reply.Term = args.Term
 		return
 	}
-
-	// fmt.Printf("server(%d), log(%v), arge(%v)\n", rf.me, rf.logs, args)
 
 	rf.persister.SaveSnapshot(args.Data)
 	rf.recvLeader <- struct{}{}
@@ -118,6 +115,21 @@ func (rf *Raft) DoSnapshot(snapshot []byte, index int) {
 	data := w.Bytes()
 	data = append(data, snapshot...)
 	rf.persister.SaveSnapshot(data)
+}
+
+func (rf *Raft) readSnapshot(snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(snapshot)
+	d := gob.NewDecoder(r)
+	var lastIndex, lastTerm int
+	d.Decode(&lastIndex)
+	d.Decode(&lastTerm)
+
+	rf.commitIndex = lastIndex
+	rf.lastApplied = lastIndex
+	rf.currentTerm = lastTerm
 }
 
 //
@@ -365,7 +377,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    rf.currentTerm,
 			Command: command,
 		})
-		DPrintf("get log server(%d) term(%d) index(%d) command(%v)", rf.me, rf.currentTerm, rf.lastLogIndex(), command)
+		// DPrintf("get log server(%d) term(%d) index(%d) command(%v)", rf.me, rf.currentTerm, rf.lastLogIndex(), command)
 		rf.persist()
 	}
 	index := rf.lastLogIndex()
@@ -439,6 +451,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.init()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.readSnapshot(persister.ReadSnapshot())
 
 	go rf.run()
 	go rf.sendMsg(applyCh)
@@ -537,8 +550,10 @@ func (rf *Raft) doCandidate() {
 		go func(server int) {
 
 			reply := &RequestVoteReply{}
+			DPrintf("sssssssss1: %d %d", server, rf.me)
 			ok := rf.sendRequestVote(server, reqVoteArgs, reply)
 			if !ok {
+				DPrintf("sssssssss2: %d %d", server, rf.me)
 				return
 			}
 
@@ -624,7 +639,6 @@ func (rf *Raft) doLeader() {
 
 					nextIndex := rf.nextIndex[server]
 					startIndex := rf.logs[0].Index // for snapshot
-					fmt.Printf("server(%d): nextIndex(%d) startIndex(%d)\n", server, nextIndex, startIndex)
 					if nextIndex > startIndex {
 						entries := make([]*LogEntry, 0)
 						if len(rf.logs) >= nextIndex-startIndex {
@@ -661,14 +675,12 @@ func (rf *Raft) doLeader() {
 
 						if !reply.Success {
 							rf.nextIndex[server] = reply.ConflictIndex
-							fmt.Println("ttttttttt")
 							return
 						}
 
 						// if leader's log has append when send broadcast
 						rf.nextIndex[server] = args.PrevLogIndex + len(entries) + 1
 						rf.matchIndex[server] = args.PrevLogIndex + len(entries)
-						fmt.Println("server:", server, rf.nextIndex[server])
 						rf.checkCommitIndex()
 					} else {
 						//lastIncludedIndex := rf.logs[0].Index

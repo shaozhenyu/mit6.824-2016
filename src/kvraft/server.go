@@ -69,6 +69,7 @@ func checkRspConsistent(req, rsp Op) bool {
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
+	//DPrintf("get |%v|", args)
 	_, ok := kv.rf.GetState()
 	if !ok {
 		reply.WrongLeader = true
@@ -101,6 +102,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	//DPrintf("putappend |%v|", args)
 	_, ok := kv.rf.GetState()
 	if !ok {
 		reply.WrongLeader = true
@@ -173,11 +175,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCliReq = make(map[int64]map[int64]struct{})
 
+	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.recvApply()
-
-	// if kv.maxraftstate != -1 {
-	// 	go kv.doSnapshot()
-	// }
 
 	return kv
 }
@@ -194,7 +193,6 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 	// DPrintf("server(%v) data(%v)", kv.me, kv.data)
 
 	if msg.UseSnapshot {
-		DPrintf("server(%d)read snapshot", kv.me)
 		kv.readSnapshot(msg.Snapshot)
 		return
 	}
@@ -202,7 +200,6 @@ func (kv *RaftKV) handleAppledCommand(msg raft.ApplyMsg) {
 	index := msg.Index
 	op, _ := msg.Command.(Op)
 
-	DPrintf("index == (%d)", index)
 	defer func() {
 		kv.sendSnapshot(index)
 		if _, ok := kv.applyChan[index]; ok {
@@ -244,6 +241,7 @@ func (kv *RaftKV) sendSnapshot(index int) {
 	}
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
+	// DPrintf("sendSnapshot %v", kv.data)
 	e.Encode(kv.data)
 	e.Encode(kv.applyCliReq)
 	kv.rf.DoSnapshot(w.Bytes(), index)
@@ -255,6 +253,10 @@ func (kv *RaftKV) readSnapshot(data []byte) {
 	if kv.data == nil {
 		kv.data = make(map[string]string)
 	}
+	var lastIndex, lastTerm int
+	d.Decode(&lastIndex)
+	d.Decode(&lastTerm)
+
 	d.Decode(&kv.data)
 	if kv.applyCliReq == nil {
 		kv.applyCliReq = make(map[int64]map[int64]struct{})
